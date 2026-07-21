@@ -1,0 +1,386 @@
+name: Organization intern PR review
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: organization-intern-pr-${{ github.repository_id }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-gate:
+    name: Organization intern PR gate
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+
+    steps:
+      - name: Check out pull request code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate Issue, assignee, and PR description
+        id: pr_content
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+              event = json.load(event_file)
+
+          pull_request = event["pull_request"]
+          body = pull_request.get("body") or ""
+          author = pull_request["user"]["login"]
+          errors = []
+
+          closing_pattern = re.compile(
+              r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(?P<number>\d+)"
+          )
+          issue_numbers = {int(match.group("number")) for match in closing_pattern.finditer(body)}
+
+          if not issue_numbers:
+              errors.append("PR 描述必须使用 Closes #编号、Fixes #编号 或 Resolves #编号关联至少一个 Issue。")
+
+          valid_issues = 0
+          for number in sorted(issue_numbers):
+              request = urllib.request.Request(
+                  f"https://api.github.com/repos/{os.environ['GH_REPOSITORY']}/issues/{number}",
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      issue = json.load(response)
+              except urllib.error.HTTPError as exc:
+                  errors.append(f"无法验证 Issue #{number}（GitHub API HTTP {exc.code}）。")
+                  continue
+
+              if "pull_request" in issue:
+                  errors.append(f"#{number} 是 Pull Request，不是 Issue。")
+                  continue
+
+              valid_issues += 1
+              assignees = {item["login"].casefold() for item in issue.get("assignees", [])}
+              if not assignees:
+                  errors.append(f"Issue #{number} 没有 Assignee；管理者必须先指定负责人。")
+              elif author.casefold() not in assignees:
+                  errors.append(f"PR 作者 {author} 不是 Issue #{number} 的 Assignee。")
+
+          if issue_numbers and valid_issues == 0:
+              errors.append("没有找到可验证的有效关联 Issue。")
+
+          def section(start_marker, end_marker):
+              match = re.search(
+                  re.escape(start_marker) + r"(.*?)" + re.escape(end_marker),
+                  body,
+                  flags=re.DOTALL,
+              )
+              return match.group(1) if match else ""
+
+          function_section = section("<!-- FUNCTION_STATUS_START -->", "<!-- FUNCTION_STATUS_END -->")
+          implementation = re.search(r"实现内容\s*[:：]\s*([^\n]+)", function_section)
+          if not implementation or len(implementation.group(1).strip()) < 10:
+              errors.append("“功能完成情况”中的“实现内容”必须填写至少 10 个字符的实际说明。")
+
+          test_section = section("<!-- TEST_RESULTS_START -->", "<!-- TEST_RESULTS_END -->")
+          test_command = re.search(r"测试命令\s*[:：]\s*([^\n]+)", test_section)
+          test_result = re.search(r"测试结果\s*[:：]\s*([^\n]+)", test_section)
+          if not test_command or len(test_command.group(1).strip()) < 2:
+              errors.append("“测试结果”中的“测试命令”必须填写实际执行的命令。")
+          if not test_result or len(test_result.group(1).strip()) < 2:
+              errors.append("“测试结果”中的“测试结果”必须填写实际结果。")
+          elif re.search(r"待填写|未执行|没有测试|N/?A|TODO", test_result.group(1), flags=re.IGNORECASE):
+              errors.append("测试结果不能使用待填写、未执行、N/A 或类似占位内容。")
+
+          if errors:
+              for error in errors:
+                  print(f"::error title=组织 PR 门禁失败::{error}")
+              print("\n组织 PR 内容检查失败：")
+              for error in errors:
+                  print(f"- {error}")
+              sys.exit(1)
+
+          print(f"PR 作者 {author} 是所有关联 Issue 的 Assignee，且 PR 内容完整。")
+          PY
+
+      - name: Prepare project dependencies
+        id: setup
+        continue-on-error: true
+        env:
+          SETUP_COMMAND: ${{ vars.SETUP_COMMAND }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${SETUP_COMMAND}" ]]; then
+            bash -euo pipefail -c "${SETUP_COMMAND}"
+          elif [[ -f pnpm-lock.yaml ]]; then
+            corepack enable
+            pnpm install --frozen-lockfile
+          elif [[ -f yarn.lock ]]; then
+            corepack enable
+            yarn install --immutable
+          elif [[ -f package-lock.json ]]; then
+            npm ci
+          elif [[ -f package.json ]]; then
+            npm install
+          elif [[ -f requirements.txt ]]; then
+            python3 -m pip install -r requirements.txt
+          elif [[ -f pyproject.toml ]]; then
+            python3 -m pip install -e .
+          elif [[ -f go.mod || -f Cargo.toml || -f Makefile ]]; then
+            echo "No separate dependency setup is required for the detected project type."
+          else
+            echo "No supported dependency manifest was found; required checks will report missing commands."
+          fi
+
+      - name: Run project tests
+        id: test
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          CHECK_COMMAND: ${{ vars.TEST_COMMAND }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${CHECK_COMMAND}" ]]; then
+            bash -euo pipefail -c "${CHECK_COMMAND}"
+          elif [[ -f package.json ]] && node -e "const p=require('./package.json'); process.exit(p.scripts?.test ? 0 : 1)"; then
+            if [[ -f pnpm-lock.yaml ]]; then pnpm run test; elif [[ -f yarn.lock ]]; then yarn test; else npm test; fi
+          elif [[ -f Makefile ]] && make -qp 2>/dev/null | awk -F: '$1 == "test" { found=1 } END { exit !found }'; then
+            make test
+          elif [[ -f go.mod ]]; then
+            go test ./...
+          elif [[ -f Cargo.toml ]]; then
+            cargo test --locked
+          elif [[ -f pyproject.toml && -d tests ]]; then
+            python3 -m pytest
+          else
+            echo "::error title=缺少真实测试命令::请提供项目标准 test 配置，或由管理员设置 Repository Variable TEST_COMMAND。"
+            exit 1
+          fi
+
+      - name: Run lint checks
+        id: lint
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          CHECK_COMMAND: ${{ vars.LINT_COMMAND }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${CHECK_COMMAND}" ]]; then
+            bash -euo pipefail -c "${CHECK_COMMAND}"
+          elif [[ -f package.json ]] && node -e "const p=require('./package.json'); process.exit(p.scripts?.lint ? 0 : 1)"; then
+            if [[ -f pnpm-lock.yaml ]]; then pnpm run lint; elif [[ -f yarn.lock ]]; then yarn lint; else npm run lint; fi
+          elif [[ -f Makefile ]] && make -qp 2>/dev/null | awk -F: '$1 == "lint" { found=1 } END { exit !found }'; then
+            make lint
+          elif [[ -f go.mod ]]; then
+            go vet ./...
+          elif [[ -f Cargo.toml ]]; then
+            cargo clippy --all-targets --all-features -- -D warnings
+          elif [[ -f pyproject.toml ]] && grep -Eq '^\[tool\.ruff([.]|$)' pyproject.toml; then
+            python3 -m ruff check .
+          else
+            echo "::error title=缺少真实 lint 命令::请提供项目标准 lint 配置，或由管理员设置 Repository Variable LINT_COMMAND。"
+            exit 1
+          fi
+
+      - name: Run build check
+        id: build
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          CHECK_COMMAND: ${{ vars.BUILD_COMMAND }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${CHECK_COMMAND}" ]]; then
+            bash -euo pipefail -c "${CHECK_COMMAND}"
+          elif [[ -f package.json ]] && node -e "const p=require('./package.json'); process.exit(p.scripts?.build ? 0 : 1)"; then
+            if [[ -f pnpm-lock.yaml ]]; then pnpm run build; elif [[ -f yarn.lock ]]; then yarn build; else npm run build; fi
+          elif [[ -f Makefile ]] && make -qp 2>/dev/null | awk -F: '$1 == "build" { found=1 } END { exit !found }'; then
+            make build
+          elif [[ -f go.mod ]]; then
+            go build ./...
+          elif [[ -f Cargo.toml ]]; then
+            cargo build --locked
+          elif [[ -f pyproject.toml ]] && grep -q '^\[build-system\]' pyproject.toml; then
+            python3 -m build
+          else
+            echo "::error title=缺少真实 build 命令::请提供项目标准 build 配置，或由管理员设置 Repository Variable BUILD_COMMAND。"
+            exit 1
+          fi
+
+      - name: Enforce organization gate
+        if: ${{ always() }}
+        env:
+          PR_CONTENT_OUTCOME: ${{ steps.pr_content.outcome }}
+          SETUP_OUTCOME: ${{ steps.setup.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          set -euo pipefail
+          failed=0
+
+          report() {
+            local name="$1"
+            local outcome="$2"
+            if [[ "${outcome}" == "success" ]]; then
+              echo "✅ ${name}: passed" >> "${GITHUB_STEP_SUMMARY}"
+            else
+              echo "❌ ${name}: ${outcome}" >> "${GITHUB_STEP_SUMMARY}"
+              failed=1
+            fi
+          }
+
+          echo "## Organization intern PR checks" >> "${GITHUB_STEP_SUMMARY}"
+          report "PR, Issue, and assignee" "${PR_CONTENT_OUTCOME}"
+          report "Dependency setup" "${SETUP_OUTCOME}"
+          report "Tests" "${TEST_OUTCOME}"
+          report "Lint" "${LINT_OUTCOME}"
+          report "Build" "${BUILD_OUTCOME}"
+
+          if [[ "${failed}" -ne 0 ]]; then
+            echo "::error title=组织确定性门禁失败::请修复 Job Summary 中的全部失败项。"
+            exit 1
+          fi
+
+  request-copilot-review:
+    name: Request organization Copilot review
+    if: >-
+      ${{
+        !github.event.pull_request.draft &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Request GitHub Copilot review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          url = f"https://api.github.com/repos/{os.environ['GH_REPOSITORY']}/pulls/{os.environ['PR_NUMBER']}/requested_reviewers"
+          request = urllib.request.Request(
+              url,
+              data=json.dumps({"reviewers": ["copilot-pull-request-reviewer[bot]"]}).encode(),
+              method="POST",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request) as response:
+                  status = response.status
+              print(f"GitHub accepted the Copilot review request (HTTP {status}).")
+          except urllib.error.HTTPError as exc:
+              message = "GitHub API did not provide a message"
+              try:
+                  message = json.load(exc).get("message", message)
+              except (ValueError, AttributeError):
+                  pass
+              print(f"::warning title=无法自动请求 Copilot Review::GitHub API HTTP {exc.code}: {message}。请检查 Copilot 方案和组织策略。")
+          PY
+
+  request-final-review:
+    name: Request organization final review
+    needs:
+      - deterministic-gate
+    if: >-
+      ${{
+        needs.deterministic-gate.result == 'success' &&
+        !github.event.pull_request.draft &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Request configured final reviewer
+        env:
+          FINAL_REVIEWER: ${{ vars.FINAL_REVIEWER }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          reviewer = os.environ.get("FINAL_REVIEWER", "").strip()
+          author = os.environ["PR_AUTHOR"]
+          if not reviewer:
+              print("::warning title=缺少 FINAL_REVIEWER::组织或仓库 Actions Variable FINAL_REVIEWER 尚未配置。")
+              raise SystemExit(0)
+          if reviewer.casefold() == author.casefold():
+              print("::warning title=FINAL_REVIEWER 配置无效::PR 作者不能批准自己的 PR。")
+              raise SystemExit(0)
+
+          url = f"https://api.github.com/repos/{os.environ['GH_REPOSITORY']}/pulls/{os.environ['PR_NUMBER']}/requested_reviewers"
+          request = urllib.request.Request(
+              url,
+              data=json.dumps({"reviewers": [reviewer]}).encode(),
+              method="POST",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                  "Content-Type": "application/json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request) as response:
+                  status = response.status
+              print(f"GitHub accepted the final reviewer request (HTTP {status}).")
+          except urllib.error.HTTPError as exc:
+              message = "GitHub API did not provide a message"
+              try:
+                  message = json.load(exc).get("message", message)
+              except (ValueError, AttributeError):
+                  pass
+              print(f"::warning title=无法请求最终 Reviewer::GitHub API HTTP {exc.code}: {message}。")
+          PY
