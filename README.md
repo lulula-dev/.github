@@ -1,19 +1,10 @@
-# lulula-dev organization governance
+# .github
 
-This public repository contains contribution templates and deterministic pull request governance for repositories owned by `lulula-dev`. It contains no product source code, credentials, or private repository content.
+Organization-wide defaults for the `lulula-app` organization.
 
-Organization repositories inherit the Issue and pull request templates when they do not define their own. An organization ruleset requires the central workflow in `.github/workflows/intern-pr-review.yml` for protected default branches.
+本仓库存放 `lulula-app` 组织的默认社区健康文件(pull request / issue 模板与贡献治理规范),自动套用到组织内所有未自行覆盖的仓库。
 
-## Repository contract
+## 生效机制
 
-Each governed repository must provide real test, lint, and build commands using standard project configuration or these repository-level Actions variables:
-
-- `SETUP_COMMAND` (optional)
-- `TEST_COMMAND`
-- `LINT_COMMAND`
-- `BUILD_COMMAND`
-
-The organization-level `FINAL_REVIEWER` variable identifies the administrator requested after deterministic checks pass. Placeholder commands such as `true` or `exit 0` are prohibited.
-
-Agents and GitHub Actions must never merge pull requests automatically.
-Organization-wide contribution templates and pull request governance
+- 本仓库需保持 **Public**:GitHub 仅从公开的 `.github` 仓库读取组织级 PR / issue 模板;
+- 各仓库如需自定义,在自身 `.github/` 目录放置同名文件即可覆盖组织默认值。
